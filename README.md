@@ -1,18 +1,19 @@
 # agent-bridge
 
-**Let your coding agents talk to each other.**
+Local MCP daemon that carries messages between Claude Code, Codex and OpenCode
+sessions on one machine, and starts a turn on an idle recipient.
 
-You run Claude Code in one terminal and Codex in another. To make them work
-together, you copy an answer out of one and paste it into the other. Every time.
+Scope: single workstation, single Unix user. Not a remote service.
 
-agent-bridge gives each agent session a mailbox. One agent sends, the other
-reads it on its next tool call. If the other one sits idle, the bridge starts a
-turn on its side, so the exchange continues while you do something else.
+## Requirements
 
-It runs on one machine, as one process, for one developer. It is not a hosted
-service.
+| Item | Version |
+| --- | --- |
+| Bun | 1.3 or later |
+| Init system | systemd user session, or any supervisor |
+| Agents | at least one of Claude Code, Codex, OpenCode |
 
-## Quick start
+## Install
 
 ```sh
 git clone https://github.com/ruipedro-pinheiro/agent-bridge ~/.local/share/mcp-servers/agent-bridge
@@ -20,161 +21,143 @@ cd ~/.local/share/mcp-servers/agent-bridge
 ./install.sh
 ```
 
-The installer generates your auth tokens, writes the config, installs the Claude
-Code hooks, and starts the systemd user service. Then connect your agents:
+`install.sh` performs:
+
+| Step | Result |
+| --- | --- |
+| dependency install | `bun install` |
+| token generation | `tokens.env`, mode 0600, 4 tokens |
+| config creation | `config.json` from `config.example.json`, `codex` path detected |
+| hook install | 3 hooks copied to `~/.claude/hooks`, declared in `settings.json` |
+| service install | systemd user unit, enabled and started |
+| health check | authenticated `GET /health` |
+
+Flags: `--no-hooks` skips the Claude Code step, `--no-service` skips systemd.
+Without systemd, start the daemon with `bun run src/index.ts`.
+
+Re-running the script keeps existing tokens, config and settings. It writes a
+backup before any migration.
+
+## Client registration
 
 ```sh
 source ~/.local/share/mcp-servers/agent-bridge/tokens.env
 
-# Claude Code
 claude mcp add --scope user --transport http agent-bridge http://127.0.0.1:7447/mcp \
   --header "Authorization: Bearer $AGENT_BRIDGE_CLAUDE_TOKEN"
 
-# Codex
 codex mcp add agent-bridge --url http://127.0.0.1:7447/mcp \
   --bearer-token-env-var AGENT_BRIDGE_CODEX_TOKEN
 
-# OpenCode
 opencode mcp add agent-bridge --url http://127.0.0.1:7447/mcp \
   --header "Authorization=Bearer $AGENT_BRIDGE_OPENCODE_TOKEN"
 ```
 
-Restart your agents so they pick up the new server. Codex needs
-`AGENT_BRIDGE_CODEX_TOKEN` in its own environment, because its MCP config stores
-the variable name rather than the value.
+Restart each agent after registration. Codex requires
+`AGENT_BRIDGE_CODEX_TOKEN` in its process environment: its MCP config stores the
+variable name, not the value.
 
-No systemd? Run `./install.sh --no-service` and start it yourself with
-`bun run src/index.ts`.
+## Tools
 
-## What it looks like
+| Tool | Arguments | Effect |
+| --- | --- | --- |
+| `send_message` | `from`, `to`, `content` | queues one delivery row per recipient |
+| `get_messages` | `for` | returns unread mail and marks it read |
+| `wait_for_messages` | `for`, `timeout_seconds` | blocks server-side, returns a preview, consumes nothing |
+| `get_history` | `limit`, `before_id` | reads visible history, marks nothing |
+| `ping` | `from` | visible agents, presence, unread counts, recent wakes |
+| `clear_conversation` | `confirm` | deletes all messages, admin token only |
 
-Claude Code hands a review to Codex and moves on:
+## Mailboxes
 
-```
-claude-api-7f2a  →  send_message  to: "codex"
-                    "Review src/auth.ts, focus on the token comparison"
+| Client | Name format | Source |
+| --- | --- | --- |
+| Claude Code | `claude-<directory>-<id>` | SessionStart hook |
+| Codex | `codex-<session-uuid>` | SessionStart hook |
+| OpenCode | `opencode` | config |
 
-                    the bridge stores it and starts a turn in the idle Codex thread
+Names match `[a-z0-9_-]{1,64}`. `to: "codex"` resolves at send time to the most
+recent registered Codex session. `to: "all"` creates one unread row per known
+mailbox. Replies go to the exact `sender` field of the received message.
 
-codex-019f6767   →  get_messages  for: "codex-019f6767-..."
-                    reads the request, reviews the file
-                    send_message  to: "claude-api-7f2a"
-                    "timingSafeEqual is used, but the length check leaks..."
-
-claude-api-7f2a  ←  reads the reply on its next tool call
-```
-
-No terminal switching, no copy and paste.
-
-## What you get
-
-- **Persistent mailboxes.** A message survives a restart and waits for its
-  recipient.
-- **Direct, alias and broadcast.** Send to one mailbox, to `codex` for the most
-  recent Codex session, or to `all`.
-- **Waits that cost nothing.** `wait_for_messages` blocks on the server and
-  returns the instant mail arrives. No polling loop, no LLM turn burned while
-  waiting.
-- **Wake for idle agents.** Codex threads and OpenCode sessions get a turn
-  started for them, with a debounce and an hourly budget.
-- **Auth per agent family.** Each client gets its own token and can only act as
-  its own mailboxes.
-- **Nothing leaves your machine.** SQLite on disk, loopback only.
-
-## How it works
+## Architecture
 
 ```
 Claude Code ──http──▶                        ┌── SQLite (WAL, 0600)
                        agent-bridge daemon ──┤
 OpenCode ────http──▶   127.0.0.1:7447/mcp    └── wake ─┬─ POST /session/{id}/prompt_async
-                       (systemd user unit)             │  to the OpenCode server
+                       (systemd user unit)             │
 Codex ───────http──▶                                   └─ codex app-server
                                                           thread/resume + turn/start
 ```
 
-One process owns the database, so concurrent writes cannot corrupt it. Every
-message gets one delivery row per recipient, which is why a broadcast never
-goes missing for the second reader.
+One process owns the database. Single writer, no concurrent-write corruption.
 
-`wait_for_messages` previews mail without consuming it. Only `get_messages`
-marks anything read, so a reply lost to a dropped connection never swallows a
-message.
+Delivery is per recipient, so a broadcast cannot be lost by a second reader.
+`wait_for_messages` previews without consuming. `get_messages` is the only
+consumer, so a reply lost to a dropped connection never marks mail read.
 
-## Tools
+## Wake
 
-| Tool | What it does |
-| --- | --- |
-| `send_message` | send to an exact mailbox, to `codex`, or to `all` |
-| `get_messages` | fetch unread mail and mark it read |
-| `wait_for_messages` | block until mail arrives, without consuming it |
-| `get_history` | read the visible conversation history |
-| `ping` | list visible agents, presence, unread counts, recent wakes |
-| `clear_conversation` | wipe every message, admin token only |
+| Target | Mechanism | Requirement |
+| --- | --- | --- |
+| Codex | `thread/resume` then `turn/start` on `app-server` | `wake.codex.command` points to the running Codex version |
+| OpenCode | `POST /session/{id}/prompt_async` | server on a fixed port, `opencode --port 14096` |
 
-Mailbox names match `[a-z0-9_-]{1,64}`. Claude Code sessions are named
-`claude-<directory>-<id>`, Codex threads `codex-<session-uuid>`, and OpenCode
-uses `opencode`. Call `ping` to see who is registered, and reply to the exact
-`sender` of the message you received.
+Guards: 30 s debounce after a successful wake, 20 wakes per rolling hour, both
+in `config.json`. An active Codex thread is retried with bounded backoff and
+never receives a concurrent turn. A failed wake is logged, never fatal: the
+message stays queued.
+
+Without `--port`, the OpenCode TUI binds a random port and the daemon cannot
+reach it. Mail still queues and is delivered on the next tool call.
 
 ## Security
 
-The default install is localhost only and authenticated.
+| Control | State |
+| --- | --- |
+| Bind address | `127.0.0.1`, non-loopback requires an explicit unsafe flag |
+| MCP auth | bearer token per client, required |
+| Token scope | per agent family, `claude-*` cannot act as `codex-*` |
+| Admin token | required for full visibility and `clear_conversation` |
+| Hook requests | HMAC signed |
+| Token storage | `tokens.env`, mode 0600, git-ignored |
+| Database | SQLite created 0600, git-ignored |
+| Wake prompts | declare mailbox content as untrusted input |
 
-- The daemon binds `127.0.0.1`. A non-loopback bind or wake URL needs an
-  explicit unsafe environment flag.
-- Every MCP client sends a bearer token. Tokens live in `tokens.env`, created
-  with mode `0600` and kept out of git.
-- A token is scoped to its agent family. The Claude token cannot act as a Codex
-  mailbox.
-- The admin token is the only one that sees everything and the only one that
-  can wipe the database.
-- Local helper hooks sign their requests with HMAC.
-- SQLite files are created `0600`.
-- Wake prompts tell the woken agent that mailbox content is untrusted input,
-  not instructions.
-
-**What this does not protect against.** This is IPC between tools running as
-your own user. Any process under the same Unix account can read `tokens.env`,
-the database, or the daemon's memory. Treat message content as untrusted text
-in your own agent instructions too, because another agent wrote it.
+Out of scope: this is IPC between processes running as the same Unix user. Any
+process under that account can read `tokens.env`, the database, or daemon
+memory. Message content is written by other agents and must be treated as
+untrusted text in agent instructions.
 
 ## Configuration
 
-`config.json` is created by the installer from `config.example.json`. Two
-sections matter:
+`config.json`, created from `config.example.json`.
 
-- `auth.clients` maps a client name to its token variable and the mailboxes it
-  may act as.
-- `wake` holds one entry per agent you want woken, with its debounce and hourly
-  budget.
+| Key | Content |
+| --- | --- |
+| `port` | listen port, default 7447 |
+| `maxMessageBytes` | per-message cap, default 65536 |
+| `auth.clients.<name>.tokenEnv` | environment variable holding the token |
+| `auth.clients.<name>.agents` | mailbox patterns the client may act as |
+| `auth.clients.<name>.admin` | grants full visibility and wipe |
+| `wake.<agent>` | wake type, target, prompt, debounce, hourly budget |
 
-Token values stay in `tokens.env` and are referenced by `tokenEnv`, so
-`config.json` never holds a secret.
+Token values stay in `tokens.env`. `config.json` holds variable names only.
 
 ## Operations
 
 ```sh
-systemctl --user status agent-bridge      # service state
-journalctl --user -u agent-bridge -f      # logs, including every wake attempt
+systemctl --user status agent-bridge
+journalctl --user -u agent-bridge -f
 
 source tokens.env
-curl -s -H "Authorization: Bearer $AGENT_BRIDGE_ADMIN_TOKEN" \
-  http://127.0.0.1:7447/health            # agents, unread counts, recent wakes
+curl -s -H "Authorization: Bearer $AGENT_BRIDGE_ADMIN_TOKEN" http://127.0.0.1:7447/health
 
-bun test                                  # 93 tests
+bun test
 bun run typecheck
-bun run prepublish:security               # secret and permission checks
+bun run prepublish:security
 ```
-
-For wake to reach OpenCode, its server needs a fixed port. Launch it with
-`opencode --port 14096`. Without the flag the TUI picks a random port each time
-and the bridge cannot find it. Mail still queues and arrives on the next tool
-call.
-
-## Requirements
-
-[Bun](https://bun.sh) 1.3 or later, a Linux user session with systemd (or any
-supervisor), and at least one of Claude Code, Codex or OpenCode.
 
 ## License
 
