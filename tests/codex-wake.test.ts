@@ -7,7 +7,7 @@ import {
 } from "../src/bridge.ts";
 import { CodexSessionRegistry } from "../src/codex-session.ts";
 import type { CodexWakeResult } from "../src/codex-app-server.ts";
-import type { WakeTarget } from "../src/wake.ts";
+import { wakeOpencode, type WakeTarget } from "../src/wake.ts";
 import { testDb } from "./helpers.ts";
 
 const A = "019f6767-789c-73b2-bc5c-ac8575f29efd";
@@ -94,6 +94,21 @@ function setup(results: CodexWakeResult[] = [{ disposition: "started", detail: "
 }
 
 describe("Codex wake orchestration", () => {
+  test("refuses non-loopback OpenCode wake URLs", async () => {
+    await expect(
+      wakeOpencode({
+        type: "opencode",
+        baseUrl: "http://example.test:14096",
+        prompt: "wake",
+        debounceSeconds: 30,
+        maxWakesPerHour: 20,
+      }),
+    ).resolves.toEqual({
+      disposition: "failed",
+      detail: expect.stringMatching(/non-loopback/i),
+    });
+  });
+
   test("uses family Codex config with full identity while preserving OpenCode target", async () => {
     const { db, registry, bridge, calls } = setup([
       { disposition: "started", detail: "codex" },

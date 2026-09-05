@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { agentMatchesPattern, type AuthConfig } from "./auth.ts";
 import { CODEX_FAMILY, CodexSessionRegistry } from "./codex-session.ts";
 import type { CodexWakeResult } from "./codex-app-server.ts";
 import type { MessageRow } from "./db.ts";
@@ -12,6 +13,7 @@ import {
 export interface BridgeConfig {
   port: number;
   maxMessageBytes: number;
+  auth?: AuthConfig;
   wake: Record<string, WakeTarget>;
 }
 
@@ -32,6 +34,8 @@ export interface BridgeRuntime {
 const AGENT_NAME_RE = /^[a-z0-9_-]{1,64}$/;
 const CANONICAL_CODEX_MAILBOX_RE =
   /^codex-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MAX_PENDING_WAITS_PER_AGENT = 8;
+const MAX_PENDING_SUBSCRIPTIONS_PER_TARGET = 8;
 
 interface Waiter {
   resolve: () => void;
@@ -296,14 +300,17 @@ export class Bridge {
 
     let aborted = false;
     await new Promise<void>((resolve) => {
+      const list = this.waiters.get(recipient) ?? [];
+      if (list.length >= MAX_PENDING_WAITS_PER_AGENT) {
+        throw new Error(`too many pending waits for "${recipient}"`);
+      }
       const waiter: Waiter = {
         resolve,
-        timer: setTimeout(() => {
+        timer: this.runtime.setTimeout(() => {
           this.removeWaiter(recipient, waiter);
           resolve();
         }, timeout * 1000),
       };
-      const list = this.waiters.get(recipient) ?? [];
       list.push(waiter);
       this.waiters.set(recipient, list);
 
@@ -311,7 +318,7 @@ export class Bridge {
       if (signal) {
         const onAbort = () => {
           aborted = true;
-          clearTimeout(waiter.timer);
+          this.runtime.clearTimeout(waiter.timer);
           this.removeWaiter(recipient, waiter);
           resolve();
         };
@@ -351,18 +358,22 @@ export class Bridge {
   ): Promise<MessageRow[]> {
     const timeout = Math.min(Math.max(Math.floor(timeoutSeconds), 1), 300);
     return new Promise<MessageRow[]>((resolve) => {
+      const matchingWaiters = this.familyWaiters.filter((fw) => fw.prefix === prefix && fw.exact === exact);
+      if (matchingWaiters.length >= MAX_PENDING_SUBSCRIPTIONS_PER_TARGET) {
+        throw new Error(`too many pending subscriptions for "${prefix}"`);
+      }
       const fw: FamilyWaiter = {
         prefix,
         exact,
         resolve,
-        timer: setTimeout(() => {
+        timer: this.runtime.setTimeout(() => {
           this.removeFamilyWaiter(fw);
           resolve([]);
         }, timeout * 1000),
       };
       this.familyWaiters.push(fw);
       onClose?.(() => {
-        clearTimeout(fw.timer);
+        this.runtime.clearTimeout(fw.timer);
         this.removeFamilyWaiter(fw);
         resolve([]); // no-op if already resolved by a send
       });
@@ -379,7 +390,7 @@ export class Bridge {
     if (!list || list.length === 0) return false;
     this.waiters.delete(recipient);
     for (const w of list) {
-      clearTimeout(w.timer);
+      this.runtime.clearTimeout(w.timer);
       w.resolve();
     }
     return true;
@@ -562,9 +573,9 @@ export class Bridge {
     return row.online ? "online" : "offline";
   }
 
-  history(limit: number, beforeId?: number) {
+  history(limit: number, beforeId?: number, visiblePatterns?: string[]) {
     const capped = Math.min(Math.max(Math.floor(limit), 1), 500);
-    const rows = (
+    const rawRows = (
       beforeId
         ? this.db
             .query(
@@ -579,11 +590,30 @@ export class Bridge {
             )
             .all(capped)
     ) as MessageRow[];
-    const { n: total } = this.db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number };
+    const rows = visiblePatterns
+      ? rawRows.filter((row) =>
+          visiblePatterns.some(
+            (pattern) =>
+              agentMatchesPattern(row.sender, pattern) || agentMatchesPattern(row.recipient, pattern),
+          ),
+        )
+      : rawRows;
+    const total = visiblePatterns
+      ? (
+          this.db
+            .query(`SELECT sender, recipient FROM messages`)
+            .all() as Array<{ sender: string; recipient: string }>
+        ).filter((row) =>
+          visiblePatterns.some(
+            (pattern) =>
+              agentMatchesPattern(row.sender, pattern) || agentMatchesPattern(row.recipient, pattern),
+          ),
+        ).length
+      : (this.db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n;
     return { messages: rows.reverse(), total };
   }
 
-  status(fromRaw?: string) {
+  status(fromRaw?: string, visiblePatterns?: string[]) {
     if (fromRaw) this.touchAgent(this.normalizeAgent(fromRaw, "from"));
     const agents = (
       this.db.query(`SELECT name, first_seen, last_seen FROM agents ORDER BY name`).all() as {
@@ -591,41 +621,51 @@ export class Bridge {
         first_seen: string;
         last_seen: string | null;
       }[]
-    ).map((a) => {
-      const presence = this.presenceOf(a.name);
-      const codexSession = this.codexSessions.getByMailbox(a.name);
-      // kill -9 never fires SessionEnd, so long-idle "online" becomes stale
-      // an agent inside a long wait is alive, never downgrade it
-      const idleSeconds = a.last_seen
-        ? Math.floor((Date.now() - Date.parse(a.last_seen)) / 1000)
-        : null;
-      const waitingNow = (this.waiters.get(a.name)?.length ?? 0) > 0;
-      const connected =
-        presence === "online" && !waitingNow && idleSeconds !== null && idleSeconds > 1800
-          ? "stale (online but idle >30min - possible crash)"
-          : presence;
-      return {
-        ...a,
-        ...(codexSession
-          ? {
-              display_label: codexSession.display_label,
-              cwd: codexSession.cwd,
-              lifecycle: codexSession.lifecycle,
-            }
-          : {}),
-        connected,
-        idle_seconds: idleSeconds,
-        waiting_now: waitingNow,
-        unread: (
-          this.db
-            .query(`SELECT COUNT(*) AS n FROM deliveries WHERE recipient = ?1 AND read_at IS NULL`)
-            .get(a.name) as { n: number }
-        ).n,
-      };
-    });
-    const lastWakes = this.db
+    )
+      .filter(
+        (a) =>
+          !visiblePatterns || visiblePatterns.some((pattern) => agentMatchesPattern(a.name, pattern)),
+      )
+      .map((a) => {
+        const presence = this.presenceOf(a.name);
+        const codexSession = this.codexSessions.getByMailbox(a.name);
+        // kill -9 never fires SessionEnd, so long-idle "online" becomes stale
+        // an agent inside a long wait is alive, never downgrade it
+        const idleSeconds = a.last_seen
+          ? Math.floor((Date.now() - Date.parse(a.last_seen)) / 1000)
+          : null;
+        const waitingNow = (this.waiters.get(a.name)?.length ?? 0) > 0;
+        const connected =
+          presence === "online" && !waitingNow && idleSeconds !== null && idleSeconds > 1800
+            ? "stale (online but idle >30min - possible crash)"
+            : presence;
+        return {
+          ...a,
+          ...(codexSession
+            ? {
+                display_label: codexSession.display_label,
+                cwd: codexSession.cwd,
+                lifecycle: codexSession.lifecycle,
+              }
+            : {}),
+          connected,
+          idle_seconds: idleSeconds,
+          waiting_now: waitingNow,
+          unread: (
+            this.db
+              .query(`SELECT COUNT(*) AS n FROM deliveries WHERE recipient = ?1 AND read_at IS NULL`)
+              .get(a.name) as { n: number }
+          ).n,
+        };
+      });
+    let lastWakes = this.db
       .query(`SELECT recipient, created_at, ok, detail FROM wakes ORDER BY id DESC LIMIT 5`)
-      .all();
+      .all() as Array<{ recipient: string; created_at: string; ok: number; detail: string }>;
+    if (visiblePatterns) {
+      lastWakes = lastWakes.filter((wake) =>
+        visiblePatterns.some((pattern) => agentMatchesPattern(wake.recipient, pattern)),
+      );
+    }
     return { daemon: "agent-bridge", startedAt: this.startedAt, agents, lastWakes };
   }
 

@@ -11,8 +11,11 @@ describe("Windows channel setup script", () => {
     expect(script).toContain("param(");
     expect(script).toContain("Get-Command bun");
     expect(script).toContain("Copy-Item");
+    expect(script).toContain("auth.ts");
+    expect(script).toContain("config.ts");
+    expect(script).toContain("token-env.ts");
     expect(script).toContain(".claude.json MCP entry");
-    expect(script).toContain("AGENT_BRIDGE_TOKEN");
+    expect(script).toContain("AGENT_BRIDGE_CLAUDE_TOKEN");
     expect(script).not.toContain("Set-Content $claudeJson");
     expect(script).not.toContain("Add-Content $claudeJson");
     expect(script).not.toContain("Write-Output $env:AGENT_BRIDGE_TOKEN");

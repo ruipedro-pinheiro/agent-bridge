@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs dependencies, config, Claude Code hooks and the systemd user unit.
-# Safe to run again: it never overwrites a file you already edited.
+# Safe to run again: it keeps backups before migrating local config.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +24,23 @@ done
 
 say()  { printf '  %s\n' "$1"; }
 step() { printf '\n== %s\n' "$1"; }
+random_token() { bun -e 'console.log(require("crypto").randomBytes(32).toString("hex"))'; }
+load_tokens() {
+  if [ -r "$ROOT/tokens.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT/tokens.env"
+    set +a
+  fi
+}
+ensure_token_var() {
+  local var="$1"
+  if ! grep -q "^${var}=" "$ROOT/tokens.env"; then
+    printf '%s=%s\n' "$var" "$(random_token)" >> "$ROOT/tokens.env"
+    return 0
+  fi
+  return 1
+}
 
 step "Checking requirements"
 if ! command -v bun >/dev/null 2>&1; then
@@ -36,9 +53,49 @@ step "Installing dependencies"
 (cd "$ROOT" && bun install --silent)
 say "done"
 
+step "Writing tokens.env"
+if [ -f "$ROOT/tokens.env" ]; then
+  chmod 600 "$ROOT/tokens.env"
+  say "tokens.env exists, left untouched"
+else
+  umask 077
+  : > "$ROOT/tokens.env"
+  chmod 600 "$ROOT/tokens.env"
+  say "created local auth tokens at $ROOT/tokens.env"
+fi
+load_tokens
+added=0
+for var in AGENT_BRIDGE_ADMIN_TOKEN AGENT_BRIDGE_CLAUDE_TOKEN AGENT_BRIDGE_CODEX_TOKEN AGENT_BRIDGE_OPENCODE_TOKEN; do
+  if ensure_token_var "$var"; then added=$((added + 1)); fi
+done
+if [ "$added" -gt 0 ]; then
+  say "added $added missing token(s)"
+  load_tokens
+fi
+
 step "Writing config.json"
 if [ -f "$ROOT/config.json" ]; then
-  say "config.json exists, left untouched"
+  if bun -e '
+    const fs = require("fs");
+    const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.exit(cfg.auth && cfg.auth.required !== false && cfg.auth.clients ? 0 : 1);
+  ' "$ROOT/config.json"; then
+    say "config.json exists with auth enabled, left untouched"
+  else
+    BACKUP="$ROOT/config.json.pre-auth.bak"
+    cp "$ROOT/config.json" "$BACKUP"
+    bun -e '
+      const fs = require("fs");
+      const [file, example] = process.argv.slice(1);
+      const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+      const sample = JSON.parse(fs.readFileSync(example, "utf8"));
+      cfg.auth ??= sample.auth;
+      cfg.auth.required = true;
+      cfg.auth.clients ??= sample.auth.clients;
+      fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
+    ' "$ROOT/config.json" "$ROOT/config.example.json"
+    say "added auth.required=true to config.json, backup kept at $BACKUP"
+  fi
 else
   CODEX_BIN="$(command -v codex || true)"
   bun -e '
@@ -51,6 +108,7 @@ else
   [ -n "$CODEX_BIN" ] && say "codex binary detected: $CODEX_BIN" \
                       || say "codex not found in PATH, edit wake.codex.command yourself"
 fi
+chmod 600 "$ROOT/config.json"
 
 if [ "$DO_HOOKS" = 1 ]; then
   step "Installing Claude Code hooks"
@@ -60,7 +118,7 @@ if [ "$DO_HOOKS" = 1 ]; then
     mkdir -p "$CLAUDE_DIR/hooks"
     cp "$ROOT"/hooks/agent-bridge-*.sh "$CLAUDE_DIR/hooks/"
     chmod +x "$CLAUDE_DIR"/hooks/agent-bridge-*.sh
-    say "copied 4 hooks to $CLAUDE_DIR/hooks/"
+    say "copied hooks to $CLAUDE_DIR/hooks/"
 
     SETTINGS="$CLAUDE_DIR/settings.json"
     [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
@@ -101,11 +159,14 @@ if [ "$DO_SERVICE" = 1 ]; then
     sed "s|%h/.local/share/mcp-servers/agent-bridge|$ROOT|g" \
       "$ROOT/agent-bridge.service.example" > "$UNIT_DIR/agent-bridge.service"
     systemctl --user daemon-reload
-    systemctl --user enable --now agent-bridge
-    say "service enabled and started"
+    systemctl --user enable agent-bridge
+    systemctl --user restart agent-bridge
+    say "service enabled and restarted"
 
     sleep 2
-    if curl -sf --max-time 5 http://127.0.0.1:7447/health >/dev/null; then
+    if curl -sf --max-time 5 \
+      -H "Authorization: Bearer ${AGENT_BRIDGE_ADMIN_TOKEN:-}" \
+      http://127.0.0.1:7447/health >/dev/null; then
       say "health check passed on http://127.0.0.1:7447"
     else
       say "health check FAILED, look at: journalctl --user -u agent-bridge -n 30"
@@ -115,15 +176,23 @@ fi
 
 step "Remaining manual step: connect your agents"
 cat <<'EOF'
+  Tokens are in:
+    ~/.local/share/mcp-servers/agent-bridge/tokens.env
+
   Claude Code:
-    claude mcp add --scope user --transport http agent-bridge http://127.0.0.1:7447/mcp
+    source ~/.local/share/mcp-servers/agent-bridge/tokens.env
+    claude mcp add --scope user --transport http agent-bridge http://127.0.0.1:7447/mcp \
+      --header "Authorization: Bearer $AGENT_BRIDGE_CLAUDE_TOKEN"
 
-  Codex, in ~/.codex/config.toml:
-    [mcp_servers.agent-bridge]
-    url = "http://127.0.0.1:7447/mcp"
+  Codex:
+    source ~/.local/share/mcp-servers/agent-bridge/tokens.env
+    codex mcp add agent-bridge --url http://127.0.0.1:7447/mcp \
+      --bearer-token-env-var AGENT_BRIDGE_CODEX_TOKEN
 
-  OpenCode, in ~/.config/opencode/opencode.jsonc:
-    { "mcp": { "agent-bridge": { "type": "remote", "url": "http://127.0.0.1:7447/mcp" } } }
+  OpenCode:
+    source ~/.local/share/mcp-servers/agent-bridge/tokens.env
+    opencode mcp add agent-bridge --url http://127.0.0.1:7447/mcp \
+      --header "Authorization=Bearer $AGENT_BRIDGE_OPENCODE_TOKEN"
 
   Then restart your agents so they pick up the new server.
 EOF

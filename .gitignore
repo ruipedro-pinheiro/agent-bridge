@@ -9,6 +9,10 @@ bridge.db-wal
 # Local configuration: absolute paths and machine-specific wake targets.
 # Copy config.example.json to config.json and edit it.
 config.json
+tokens.env
+*.env
+!.env.example
+*.bak
 
 # Local snapshots taken before refactors.
 backups/

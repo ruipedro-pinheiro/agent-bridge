@@ -13,6 +13,7 @@ const MAILBOX = canonicalCodexMailbox(SESSION_ID);
 const CONFIG: BridgeConfig = { port: 7447, maxMessageBytes: 64 * 1024, wake: {} };
 const SCRIPT = new URL("../scripts/codex-hook.ts", import.meta.url).pathname;
 const ROOT = new URL("..", import.meta.url).pathname;
+let nextPort = 19_800;
 
 function setup() {
   const db = testDb();
@@ -150,6 +151,21 @@ async function runScript(payload: unknown, url: string, timeoutMs = 2000) {
   return { exitCode, stdout: stdout.trim(), stderr };
 }
 
+function startServer(fetch: (request: Request) => Response | Promise<Response>): Server<unknown> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      return Bun.serve({
+        hostname: "127.0.0.1",
+        port: nextPort++,
+        fetch,
+      });
+    } catch {
+      nextPort++;
+    }
+  }
+  throw new Error("could not allocate a local test port");
+}
+
 describe("codex hook command", () => {
   let server: Server<unknown> | undefined;
 
@@ -165,16 +181,12 @@ describe("codex hook command", () => {
         additionalContext: "canonical context",
       },
     };
-    server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: async (request) => {
+    server = startServer(async (request) => {
         expect(request.method).toBe("POST");
         expect(new URL(request.url).pathname).toBe("/codex/hook");
         expect(await request.json()).toMatchObject({ session_id: SESSION_ID });
         return Response.json(expected);
-      },
-    });
+      });
 
     const result = await runScript(
       { hook_event_name: "SessionStart", session_id: SESSION_ID },
@@ -185,11 +197,7 @@ describe("codex hook command", () => {
   });
 
   test("fails open on timeout", async () => {
-    server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: () => new Promise<Response>(() => {}),
-    });
+    server = startServer(() => new Promise<Response>(() => {}));
 
     const result = await runScript(
       { hook_event_name: "Stop", session_id: SESSION_ID },
@@ -203,7 +211,7 @@ describe("codex hook command", () => {
   });
 
   test("fails open on connection refusal", async () => {
-    server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("unused") });
+    server = startServer(() => new Response("unused"));
     const refusedUrl = `http://127.0.0.1:${server.port}/codex/hook`;
     server.stop(true);
     server = undefined;
@@ -219,16 +227,24 @@ describe("codex hook command", () => {
     expect(result.stderr).not.toBe("");
   });
 
+  test("fails open without posting hook payloads to non-loopback URLs", async () => {
+    const result = await runScript(
+      { hook_event_name: "SessionStart", session_id: SESSION_ID },
+      "http://bridge.example.test/codex/hook",
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("{}");
+    expect(result.stderr).toMatch(/non-loopback/i);
+  });
+
   test("fails open on a bridge 5xx or invalid JSON response", async () => {
     let invalidJson = false;
-    server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: () =>
+    server = startServer(() =>
         invalidJson
           ? new Response("not-json", { status: 200 })
           : Response.json({ error: "local failure" }, { status: 500 }),
-    });
+    );
     const url = `http://127.0.0.1:${server.port}/codex/hook`;
 
     const failed = await runScript({}, url);

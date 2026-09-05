@@ -5,13 +5,27 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import * as z from "zod/v4";
+import {
+  assertAdmin,
+  assertAgentAuthorized,
+  assertFamilyAuthorized,
+  authenticateRequest,
+  buildAuthRuntime,
+  disabledAuthInfo,
+  visibleAgentPatterns,
+  type AgentBridgeAuthInfo,
+} from "./auth.ts";
 import { openDb } from "./db.ts";
 import { Bridge, type BridgeConfig } from "./bridge.ts";
 import { handleCodexHook } from "./codex-hook.ts";
 import { CodexSessionRegistry } from "./codex-session.ts";
+import { isLoopbackBindHost, loadBridgeConfigFromText, resolveBindHost } from "./config.ts";
+import { loadTokenEnvFile } from "./token-env.ts";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+loadTokenEnvFile();
 const config: BridgeConfig = loadConfig();
+const auth = buildAuthRuntime(config.auth);
 
 function loadConfig(): BridgeConfig {
   const path = join(ROOT, "config.json");
@@ -24,9 +38,9 @@ function loadConfig(): BridgeConfig {
     process.exit(1);
   }
   try {
-    return JSON.parse(raw) as BridgeConfig;
+    return loadBridgeConfigFromText(raw);
   } catch (err) {
-    console.error(`agent-bridge: ${path} is not valid JSON`);
+    console.error(`agent-bridge: ${path} is not valid`);
     console.error(String(err));
     process.exit(1);
   }
@@ -50,6 +64,58 @@ function asError(err: unknown) {
   };
 }
 
+function authFromExtra(extra: { authInfo?: unknown } | undefined): AgentBridgeAuthInfo {
+  const authInfo = extra?.authInfo as AgentBridgeAuthInfo | undefined;
+  if (auth.required && !authInfo) throw new Error("missing authenticated request context");
+  return authInfo ?? disabledAuthInfo();
+}
+
+function headersFromRequest(req: ExpressRequest): Record<string, string | undefined> {
+  const headers: Record<string, string | undefined> = {};
+  for (const [name, value] of Object.entries(req.headers ?? {})) {
+    headers[name.toLowerCase()] = Array.isArray(value) ? value.join(",") : value === undefined ? undefined : String(value);
+  }
+  return headers;
+}
+
+function requestPath(req: ExpressRequest): string {
+  return String(req.originalUrl ?? req.url ?? "/");
+}
+
+function attachAuth(req: ExpressRequest, res: ExpressResponse, next: () => void): void {
+  try {
+    req.auth = authenticateRequest(auth, {
+      method: String(req.method ?? "GET"),
+      url: requestPath(req),
+      body: req.body,
+      headers: headersFromRequest(req),
+    });
+    next();
+  } catch (error) {
+    res.status(401).json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32001,
+        message: "authentication failed",
+      },
+      id: null,
+    });
+  }
+}
+
+function singleQueryParam(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error(`${field} must be a single string`);
+  return value;
+}
+
+function timeoutQueryParam(value: unknown, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string") throw new Error("timeout must be a single value");
+  const timeout = Number(value);
+  return Number.isFinite(timeout) ? timeout : fallback;
+}
+
 function buildServer(): McpServer {
   const server = new McpServer({ name: "agent-bridge", version: "1.0.0" });
 
@@ -67,8 +133,9 @@ function buildServer(): McpServer {
         content: z.string().describe("The message text"),
       },
     },
-    async ({ from, to, content }) => {
+    async ({ from, to, content }, extra) => {
       try {
+        assertAgentAuthorized(authFromExtra(extra), bridge.normalizeAgent(from, "from"), "from");
         return asText(bridge.send(from, to, content));
       } catch (err) {
         return asError(err);
@@ -84,8 +151,9 @@ function buildServer(): McpServer {
         for: z.string().describe("Your exact mailbox; Codex must use its canonical full-UUID mailbox"),
       },
     },
-    async ({ for: forAgent }) => {
+    async ({ for: forAgent }, extra) => {
       try {
+        assertAgentAuthorized(authFromExtra(extra), bridge.normalizeAgent(forAgent, "for"), "for");
         const messages = bridge.fetchUnread(forAgent);
         return asText({ messages, note: messages.length === 0 ? "no new messages" : undefined });
       } catch (err) {
@@ -122,6 +190,7 @@ function buildServer(): McpServer {
       },
     },
     async ({ for: forAgent, timeout_seconds }, extra) => {
+      const requestAuth = authFromExtra(extra);
       const progressToken = extra?._meta?.progressToken;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
       if (progressToken !== undefined) {
@@ -142,6 +211,7 @@ function buildServer(): McpServer {
         heartbeat = setInterval(beat, HEARTBEAT_MS);
       }
       try {
+        assertAgentAuthorized(requestAuth, bridge.normalizeAgent(forAgent, "for"), "for");
         const messages = await bridge.waitForMessages(
           forAgent,
           timeout_seconds,
@@ -173,9 +243,9 @@ function buildServer(): McpServer {
         before_id: z.number().optional().describe("Paginate: only messages with id lower than this"),
       },
     },
-    async ({ limit, before_id }) => {
+    async ({ limit, before_id }, extra) => {
       try {
-        return asText(bridge.history(limit, before_id));
+        return asText(bridge.history(limit, before_id, visibleAgentPatterns(authFromExtra(extra))));
       } catch (err) {
         return asError(err);
       }
@@ -191,9 +261,11 @@ function buildServer(): McpServer {
         from: z.string().optional().describe("Your agent name (updates your last_seen)"),
       },
     },
-    async ({ from }) => {
+    async ({ from }, extra) => {
       try {
-        return asText(bridge.status(from));
+        const requestAuth = authFromExtra(extra);
+        if (from) assertAgentAuthorized(requestAuth, bridge.normalizeAgent(from, "from"), "from");
+        return asText(bridge.status(from, visibleAgentPatterns(requestAuth)));
       } catch (err) {
         return asError(err);
       }
@@ -208,8 +280,9 @@ function buildServer(): McpServer {
         confirm: z.string().describe('Must be exactly "wipe"'),
       },
     },
-    async ({ confirm }) => {
+    async ({ confirm }, extra) => {
       try {
+        assertAdmin(authFromExtra(extra));
         return asText(bridge.clear(confirm));
       } catch (err) {
         return asError(err);
@@ -220,9 +293,20 @@ function buildServer(): McpServer {
   return server;
 }
 
-const bindHost = Bun.env.AGENT_BRIDGE_BIND?.trim() || "127.0.0.1";
+const bindHost = resolveBindHost();
+if (!isLoopbackBindHost(bindHost) && !auth.required) {
+  console.error("agent-bridge: refusing non-loopback bind while auth is disabled");
+  process.exit(1);
+}
 
 const app = createMcpExpressApp({ host: bindHost });
+app.disable("x-powered-by");
+app.use((_req: ExpressRequest, res: ExpressResponse, next: () => void) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+app.use(attachAuth);
 
 app.post("/mcp", async (req: ExpressRequest, res: ExpressResponse) => {
   const server = buildServer();
@@ -248,11 +332,12 @@ app.get("/mcp", reject405);
 app.delete("/mcp", reject405);
 
 app.get("/health", (_req: ExpressRequest, res: ExpressResponse) => {
-  res.json({ ok: true, ...bridge.status() });
+  res.json({ ok: true, ...bridge.status(undefined, visibleAgentPatterns(_req.auth)) });
 });
 
 app.post("/codex/hook", (req: ExpressRequest, res: ExpressResponse) => {
   try {
+    assertFamilyAuthorized(req.auth, "codex", "codex hook");
     const result = handleCodexHook(bridge, codexSessions, req.body);
     res.status(result.status).json(result.body);
   } catch (error) {
@@ -263,14 +348,19 @@ app.post("/codex/hook", (req: ExpressRequest, res: ExpressResponse) => {
 
 app.get("/subscribe", async (req: ExpressRequest, res: ExpressResponse) => {
   try {
-    const mailbox = req.query.mailbox === undefined ? undefined : String(req.query.mailbox);
-    const prefix = req.query.prefix === undefined ? undefined : String(req.query.prefix);
-    const rawTimeout = Number(req.query.timeout ?? 55);
-    const timeout = Number.isFinite(rawTimeout) ? rawTimeout : 55;
+    const mailbox = singleQueryParam(req.query.mailbox, "mailbox");
+    const prefix = singleQueryParam(req.query.prefix, "prefix");
+    const timeout = timeoutQueryParam(req.query.timeout, 55);
     const onClose = (cleanup: () => void) => res.on("close", cleanup);
-    const messages = mailbox
-      ? await bridge.subscribeMailbox(mailbox, timeout, onClose)
-      : await bridge.subscribeFamily(prefix ?? "", timeout, onClose);
+    let messages;
+    if (mailbox) {
+      assertAgentAuthorized(req.auth, bridge.normalizeAgent(mailbox, "mailbox"), "mailbox");
+      messages = await bridge.subscribeMailbox(mailbox, timeout, onClose);
+    } else {
+      const familyPrefix = bridge.normalizeAgent(prefix ?? "", "prefix");
+      assertFamilyAuthorized(req.auth, familyPrefix, "prefix");
+      messages = await bridge.subscribeFamily(familyPrefix, timeout, onClose);
+    }
     if (!res.writableEnded) res.json({ messages });
   } catch (err) {
     if (!res.headersSent) {
@@ -286,6 +376,7 @@ app.post("/presence", (req: ExpressRequest, res: ExpressResponse) => {
       res.status(400).json({ error: "expected {agent: string, online: boolean}" });
       return;
     }
+    assertAgentAuthorized(req.auth, bridge.normalizeAgent(agent, "agent"), "agent");
     bridge.setPresence(agent, online);
     res.json({ ok: true });
   } catch (err) {

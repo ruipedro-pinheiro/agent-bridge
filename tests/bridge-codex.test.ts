@@ -14,6 +14,8 @@ const CONFIG: BridgeConfig = {
   wake: {},
 };
 
+const CLAUDE_SCOPE = ["claude-*"];
+
 function setup() {
   const db = openDb(":memory:");
   const registry = new CodexSessionRegistry(db);
@@ -97,6 +99,21 @@ describe("Bridge Codex routing", () => {
         bridge.waitForMessages("codex", 5, AbortSignal.abort()),
       ).rejects.toThrow(/recipient-only alias/i);
     } finally {
+      db.close();
+    }
+  });
+
+  test("caps pending wait_for_messages calls per mailbox", async () => {
+    const { bridge, db } = setup();
+    const controller = new AbortController();
+    try {
+      const waits = Array.from({ length: 8 }, () => bridge.waitForMessages("claude", 30, controller.signal));
+
+      await expect(bridge.waitForMessages("claude", 30, controller.signal)).rejects.toThrow(/too many pending waits/i);
+      controller.abort();
+      await expect(Promise.all(waits)).resolves.toEqual(Array.from({ length: 8 }, () => []));
+    } finally {
+      controller.abort();
       db.close();
     }
   });
@@ -284,6 +301,22 @@ describe("Bridge Codex routing", () => {
           recipient: "opencode",
           content: "direct",
         }),
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("filters history to conversations visible to the authenticated agent scope", () => {
+    const { bridge, db } = setup();
+    try {
+      bridge.send("claude-api-a1b2", "opencode", "visible outbound");
+      bridge.send("opencode", "claude-api-a1b2", "visible inbound");
+      bridge.send("codex-other", "opencode", "hidden");
+
+      expect(bridge.history(50, undefined, CLAUDE_SCOPE).messages).toEqual([
+        expect.objectContaining({ sender: "claude-api-a1b2", content: "visible outbound" }),
+        expect.objectContaining({ recipient: "claude-api-a1b2", content: "visible inbound" }),
       ]);
     } finally {
       db.close();

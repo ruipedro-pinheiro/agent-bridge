@@ -4,6 +4,7 @@ import {
   wakeCodexThread,
   type CodexWakeResult,
 } from "./codex-app-server.ts";
+import { normalizeLoopbackHttpBaseUrl } from "./config.ts";
 
 let proxyUnavailable = false;
 
@@ -38,9 +39,19 @@ interface OpencodeSession {
 const FETCH_TIMEOUT_MS = 5000;
 
 export async function wakeOpencode(target: OpencodeWakeTarget): Promise<WakeResult> {
+  let baseUrl: string;
+  try {
+    baseUrl = normalizeLoopbackHttpBaseUrl(target.baseUrl);
+  } catch (error) {
+    return {
+      disposition: "failed",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
   let sessions: OpencodeSession[];
   try {
-    const res = await fetch(`${target.baseUrl}/session`, {
+    const res = await fetch(`${baseUrl}/session`, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (!res.ok) return { disposition: "failed", detail: `GET /session -> ${res.status}` };
@@ -56,7 +67,7 @@ export async function wakeOpencode(target: OpencodeWakeTarget): Promise<WakeResu
 
   const session = candidates[0];
   try {
-    const res = await fetch(`${target.baseUrl}/session/${session.id}/prompt_async`, {
+    const res = await fetch(`${baseUrl}/session/${encodeURIComponent(session.id)}/prompt_async`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ parts: [{ type: "text", text: target.prompt }] }),

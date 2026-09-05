@@ -31,4 +31,16 @@ describe("channel mailbox subscription", () => {
       { sender: "opencode", recipient: "all", content: "broadcast" },
     ]);
   });
+
+  test("caps pending channel subscriptions per target", async () => {
+    const bridge = new Bridge(testDb(), CONFIG);
+    const cleanups: Array<() => void> = [];
+    const subscriptions = Array.from({ length: 8 }, () =>
+      bridge.subscribeFamily("claude", 300, (cleanup) => cleanups.push(cleanup)),
+    );
+
+    await expect(bridge.subscribeFamily("claude", 300)).rejects.toThrow(/too many pending subscriptions/i);
+    for (const cleanup of cleanups) cleanup();
+    await expect(Promise.all(subscriptions)).resolves.toEqual(Array.from({ length: 8 }, () => []));
+  });
 });

@@ -1,4 +1,8 @@
-const url = process.env.AGENT_BRIDGE_CODEX_HOOK_URL ?? "http://127.0.0.1:7447/codex/hook";
+import { signAgentBridgeRequest } from "../src/auth.ts";
+import { normalizeLoopbackHttpBaseUrl } from "../src/config.ts";
+import { clientTokenFromEnv, loadTokenEnvFile } from "../src/token-env.ts";
+
+const rawUrl = process.env.AGENT_BRIDGE_CODEX_HOOK_URL ?? "http://127.0.0.1:7447/codex/hook";
 const configuredTimeout = Number(process.env.AGENT_BRIDGE_CODEX_HOOK_TIMEOUT_MS ?? 2000);
 const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 2000;
 
@@ -8,25 +12,34 @@ function failOpen(error: unknown): void {
 }
 
 try {
+  loadTokenEnvFile(process.env);
+  const url = normalizeLoopbackHttpBaseUrl(rawUrl, process.env);
   const text = await Bun.stdin.text();
   const payload = JSON.parse(text) as unknown;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("stdin must contain one JSON object");
   }
+  const requestBody = JSON.stringify(payload);
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const clientId = process.env.AGENT_BRIDGE_CLIENT_ID ?? "codex";
+  const token = clientTokenFromEnv(clientId, process.env);
+  if (token) {
+    Object.assign(headers, signAgentBridgeRequest({ clientId, token, method: "POST", url, body: payload }));
+  }
 
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+    headers,
+    body: requestBody,
     signal: AbortSignal.timeout(timeoutMs),
   });
-  if (response.status >= 500) throw new Error(`bridge returned HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`bridge returned HTTP ${response.status}`);
 
-  const body = (await response.json()) as unknown;
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
+  const responseBody = (await response.json()) as unknown;
+  if (!responseBody || typeof responseBody !== "object" || Array.isArray(responseBody)) {
     throw new Error("bridge returned invalid JSON");
   }
-  console.log(JSON.stringify(body));
+  console.log(JSON.stringify(responseBody));
 } catch (error) {
   failOpen(error);
 }

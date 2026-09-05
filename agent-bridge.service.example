@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 # Set both paths to your own bun binary and repository directory.
+EnvironmentFile=%h/.local/share/mcp-servers/agent-bridge/tokens.env
 ExecStart=%h/.bun/bin/bun run %h/.local/share/mcp-servers/agent-bridge/src/index.ts
 WorkingDirectory=%h/.local/share/mcp-servers/agent-bridge
 Restart=on-failure

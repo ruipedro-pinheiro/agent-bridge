@@ -18,15 +18,23 @@ describe("channel config", () => {
 
   test("reads bridge URL and mailbox from env", () => {
     const config = readChannelConfig({
-      AGENT_BRIDGE_URL: "https://bridge.example.test:7447/",
+      AGENT_BRIDGE_URL: "http://127.0.0.1:8744/",
       AGENT_BRIDGE_MAILBOX: "claude-desktop-a1b2",
     });
 
     expect(config).toEqual({
-      bridgeUrl: "https://bridge.example.test:7447",
+      bridgeUrl: "http://127.0.0.1:8744",
       mailbox: "claude-desktop-a1b2",
       exact: true,
     });
+  });
+
+  test("refuses non-loopback bridge URLs", () => {
+    expect(() =>
+      readChannelConfig({
+        AGENT_BRIDGE_URL: "http://bridge.example.test:7447/",
+      }),
+    ).toThrow(/non-loopback/i);
   });
 
   test("strips trailing slashes from the bridge URL", () => {
@@ -37,12 +45,12 @@ describe("channel config", () => {
 
   test("builds an exact mailbox subscribe URL when a mailbox is configured", () => {
     const url = buildSubscribeUrl({
-      bridgeUrl: "https://bridge.example.test/base/",
+      bridgeUrl: "http://127.0.0.1:8744/base/",
       mailbox: "claude-desktop-a1b2",
       exact: true,
     }, 290);
 
-    expect(url).toBe("https://bridge.example.test/base/subscribe?mailbox=claude-desktop-a1b2&timeout=290");
+    expect(url).toBe("http://127.0.0.1:8744/base/subscribe?mailbox=claude-desktop-a1b2&timeout=290");
   });
 
   // Regression: the shim asked for ?mailbox=claude, which the daemon matches

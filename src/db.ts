@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "fs";
 import { dirname } from "path";
 
 export interface MessageRow {
@@ -12,6 +12,10 @@ export interface MessageRow {
 
 export function openDb(path: string): Database {
   mkdirSync(dirname(path), { recursive: true });
+  if (path !== ":memory:") {
+    closeSync(openSync(path, "a", 0o600));
+    chmodSync(path, 0o600);
+  }
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
@@ -60,5 +64,10 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_codex_sessions_recent
       ON codex_sessions(family, last_seen DESC);
   `);
+  if (path !== ":memory:") {
+    for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+      if (existsSync(candidate)) chmodSync(candidate, 0o600);
+    }
+  }
   return db;
 }
